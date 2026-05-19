@@ -369,21 +369,25 @@ def run(proxy: Optional[str], account: dict) -> Optional[tuple[str, str, str]]:
             "content-type": "application/json"
         }
         # 验证码校验不需要 sentinel token
-        print("Cookies before validate:", s.cookies)
-        code_resp = s.post("https://auth.openai.com/api/accounts/email-otp/validate", headers=validate_headers, data=json.dumps({"code": code}))
-        print(f"[*] validate response: {code_resp.status_code} {code_resp.text}")
-        if code_resp.status_code != 200:
+                code_resp = s.post("https://auth.openai.com/api/accounts/email-otp/validate", headers=validate_headers, data=json.dumps({"code": code}))
+                if code_resp.status_code != 200:
             print(f"[Error] 验证码校验失败: {code_resp.status_code}")
             return None
 
         # 第八步：检查是否需要完成账号注册填写
         continue_url = code_resp.json().get("continue_url", "")
+        if "code=" in continue_url and "state=" in continue_url:
+            print("[*] 账号已存在，直接登录成功，提取 Token...")
+            token_json = submit_callback_url(callback_url=continue_url, code_verifier=oauth.code_verifier, redirect_uri=oauth.redirect_uri, expected_state=oauth.state)
+            return token_json, email_addr, password
+
         if "about-you" in continue_url:
             mode = "passwordless_signup"
         else:
             mode = "passwordless_login"
             
         if mode == "passwordless_signup":
+            print("[*] 该邮箱尚未注册或未完成注册，进入填写账户信息步骤 (about-you)...")
             create_headers = {
                 "origin": "https://auth.openai.com",
                 "referer": "https://auth.openai.com/about-you", 
@@ -391,12 +395,15 @@ def run(proxy: Optional[str], account: dict) -> Optional[tuple[str, str, str]]:
                 "content-type": "application/json"
             }
             if so_token: create_headers["openai-sentinel-so-token"] = so_token
+            if sentinel: create_headers["openai-sentinel-token"] = sentinel
             create_resp = s.post("https://auth.openai.com/api/accounts/create_account", headers=create_headers, data=json.dumps({"name": _random_name(), "birthdate": _random_birthdate()}))
             if create_resp.status_code != 200:
-                print(f"[Error] 账户信息填写失败: {create_resp.status_code} {create_resp.text}")
+                print(f"[Error] 账户注册被拒绝 (registration_disallowed): {create_resp.status_code}")
+                print(f"  -> 当前账号为新账号，但由于代理 IP 质量问题或缺少浏览器 Turnstile 验证，OpenAI 拒绝了建号请求。")
                 return None
+            print("[*] 新账号注册并填写信息成功！")
         else:
-            print(f"[*] 检测到 login 模式 ({mode})，跳过 create_account 步骤")
+            print(f"[*] 该账号已存在，验证码验证后成功登录！跳过 create_account 步骤。")
 
         # 第九步：选择工作区 Workspace
         auth_cookie = s.cookies.get("oai-client-auth-session")
@@ -419,7 +426,7 @@ def run(proxy: Optional[str], account: dict) -> Optional[tuple[str, str, str]]:
             next_url = urllib.parse.urljoin(current_url, location)
             if "code=" in next_url and "state=" in next_url:
                 token_json = submit_callback_url(callback_url=next_url, code_verifier=oauth.code_verifier, redirect_uri=oauth.redirect_uri, expected_state=oauth.state)
-                return token_json, email, password
+                return token_json, email_addr, password
             current_url = next_url
 
         print("[Error] 未能在重定向链中捕获到最终 Token")
@@ -456,7 +463,7 @@ def main():
     if proxy_list:
         print(f"[*] 成功加载 {len(proxy_list)} 个代理")
 
-    account_index = 0
+    account_index = 19
 
     while account_index < len(accounts):
         count += 1
