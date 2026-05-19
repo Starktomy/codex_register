@@ -345,6 +345,7 @@ def run(proxy: Optional[str], account: dict) -> Optional[tuple[str, str, str]]:
 
         signin_url = f"https://chatgpt.com/api/auth/signin/openai?prompt=signup&ext-oai-did={did}&auth_session_logging_id={login_id}&screen_hint=signup&login_hint={urllib.parse.quote(email)}"
         resp = s.post(signin_url, data={"csrfToken": csrf_token}, allow_redirects=True, timeout=15)
+        print(f"[*] Signin redirected to: {resp.url}")
 
         # 第二步：获取 Sentinel SO Token (oauth_create_account)
         so_token = fetch_sentinel_token(flow="oauth_create_account", did=did, proxies=proxies)
