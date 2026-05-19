@@ -346,44 +346,11 @@ def run(proxy: Optional[str], account: dict) -> Optional[tuple[str, str, str]]:
         signin_url = f"https://chatgpt.com/api/auth/signin/openai?prompt=signup&ext-oai-did={did}&auth_session_logging_id={login_id}&screen_hint=signup&login_hint={urllib.parse.quote(email)}"
         resp = s.post(signin_url, data={"csrfToken": csrf_token}, allow_redirects=True, timeout=15)
 
-        # 第二步：获取 Sentinel Token (authorize_continue)
-        sen_token = fetch_sentinel_token(flow="authorize_continue", did=did, proxies=proxies)
-        sentinel = json.dumps({"p": "", "t": "", "c": sen_token, "id": did, "flow": "authorize_continue"}) if sen_token else None
-
-        # 第三步：获取 Sentinel SO Token (oauth_create_account)
+        # 第二步：获取 Sentinel SO Token (oauth_create_account)
         so_token = fetch_sentinel_token(flow="oauth_create_account", did=did, proxies=proxies)
 
-        # 第四步：提交邮箱授权
-        signup_headers = {"origin": "https://auth.openai.com", "referer": "https://auth.openai.com/create-account", "accept": "application/json", "content-type": "application/json"}
-        if sentinel: signup_headers["openai-sentinel-token"] = sentinel
-        signup_resp = s.post("https://auth.openai.com/api/accounts/authorize/continue", headers=signup_headers, data=json.dumps({"username": {"value": email, "kind": "email"}, "screen_hint": "signup"}))
-        print(f"[*] authorize/continue response: {signup_resp.status_code} {signup_resp.text}")
-        if signup_resp.status_code != 200:
-            print(f"[Error] 提交邮箱失败: {signup_resp.status_code}")
-            return None
 
-
-        continue_page = signup_resp.json().get("page", {}).get("type")
-        if continue_page == "create_account_password":
-            # Flow A: Password required
-            register_headers = {
-                "origin": "https://auth.openai.com",
-                "referer": "https://auth.openai.com/create-account/password", 
-                "accept": "application/json", 
-                "content-type": "application/json"
-            }
-            if sentinel: register_headers["openai-sentinel-token"] = sentinel
-            reg_resp = s.post("https://auth.openai.com/api/accounts/user/register", headers=register_headers, data=json.dumps({"password": password, "username": email}))
-            print(f"[*] user/register response: {reg_resp.status_code} {reg_resp.text}")
-            if reg_resp.status_code != 200:
-                print(f"[Error] 设置密码失败: {reg_resp.status_code}")
-                return None
-
-            send_resp = s.get("https://auth.openai.com/api/accounts/email-otp/send", headers=register_headers, timeout=15)
-            print(f"[*] email-otp/send response: {send_resp.status_code} {send_resp.text}")
-        else:
-            # Flow B: Passwordless
-            print("[*] Flow B: Passwordless. OTP already sent by authorize/continue or signin.")
+        print("[*] Flow: Passwordless. OTP already sent by signin.")
 
         
         # 第六步：提取验证码
@@ -400,7 +367,7 @@ def run(proxy: Optional[str], account: dict) -> Optional[tuple[str, str, str]]:
             "accept": "application/json", 
             "content-type": "application/json"
         }
-        if sentinel: validate_headers["openai-sentinel-token"] = sentinel
+        # 验证码校验不需要 sentinel token
         print("Cookies before validate:", s.cookies)
         code_resp = s.post("https://auth.openai.com/api/accounts/email-otp/validate", headers=validate_headers, data=json.dumps({"code": code}))
         print(f"[*] validate response: {code_resp.status_code} {code_resp.text}")
@@ -409,10 +376,11 @@ def run(proxy: Optional[str], account: dict) -> Optional[tuple[str, str, str]]:
             return None
 
         # 第八步：检查是否需要完成账号注册填写
-        try:
-            mode = signup_resp.json().get("page", {}).get("payload", {}).get("email_verification_mode")
-        except:
+        continue_url = code_resp.json().get("continue_url", "")
+        if "about-you" in continue_url:
             mode = "passwordless_signup"
+        else:
+            mode = "passwordless_login"
             
         if mode == "passwordless_signup":
             create_headers = {
