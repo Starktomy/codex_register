@@ -22,115 +22,136 @@ from curl_cffi.requests import Session
 
 # 配置输出目录和请求UA
 OUT_DIR = Path(__file__).parent.resolve()
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
 
-# ========== 1. Mail.tm 临时邮箱处理模块 ==========
+# ========== 1. Outlook XOAUTH2 临时邮箱处理模块 ==========
 
-def rstr(n=10): 
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+import imaplib
+import email
+from email.header import decode_header
 
-def mreq(mt, pt, js=None, tk=None, proxies=None):
-    hdrs = {
-        "content-type": "application/json",
-        "accept": "application/json",
-        "user-agent": UA,
-        "pragma": "no-cache"
-    }
-    if tk: 
-        hdrs["authorization"] = f"Bearer {tk}"
+OUTLOOK_ACCOUNTS_FILE = OUT_DIR / "accounts.txt"
+
+PROXY_FILE = OUT_DIR / "proxy.txt"
+
+def load_proxies():
+    if not PROXY_FILE.exists():
+        return []
+    proxies = []
+    for line in PROXY_FILE.read_text("utf-8").splitlines():
+        line = line.strip()
+        if line:
+            proxies.append(f"http://{line}")
+    return proxies
+
+
+def load_outlook_accounts():
+    if not OUTLOOK_ACCOUNTS_FILE.exists():
+        print(f"[!] 找不到账号文件: {OUTLOOK_ACCOUNTS_FILE}")
+        return []
+    accs = []
+    for line in OUTLOOK_ACCOUNTS_FILE.read_text("utf-8").splitlines():
+        line = line.strip()
+        if not line: continue
+        parts = line.split("----")
+        if len(parts) >= 4:
+            accs.append({
+                "email": parts[0],
+                "password": parts[1],
+                "client_id": parts[2],
+                "refresh_token": parts[3]
+            })
+    return accs
+
+def get_outlook_access_token(client_id, refresh_token, proxies=None):
     try:
-        with Session(proxies=proxies) as s:
-            return s.request(mt, f"https://api.mail.tm{pt}", json=js, headers=hdrs, timeout=20)
-    except: 
-        return None
-
-def getotp(tk, proxies=None):
-    for _ in range(60):
-        r = mreq("GET", "/messages", tk=tk, proxies=proxies)
-        if r and r.status_code == 200:
-            try: 
-                dat = r.json()
-            except: 
-                time.sleep(8); continue
-                
-            msgs = dat.get("hydra:member", []) if isinstance(dat, dict) else dat
-            if not isinstance(msgs, list): msgs = []
-                
-            for m in msgs:
-                if not isinstance(m, dict): continue
-                sb = m.get("subject", "")
-                intro = m.get("intro", "")
-                if "OpenAI" in sb or "ChatGPT" in sb or "code" in intro:
-                    rb = mreq("GET", f"/messages/{m.get('id')}", tk=tk, proxies=proxies)
-                    if rb and rb.status_code == 200:
-                        txt = rb.json().get("text", "")
-                        mt = re.search(r"(\d{6})", txt) or re.search(r"(\d{6})", sb)
-                        if mt: 
-                            return mt.group(1)
-        time.sleep(8)
+        url = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        data = {
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token
+        }
+        with requests.Session(proxies=proxies) as s:
+            r = s.post(url, data=data, timeout=15)
+            if r.status_code == 200:
+                return r.json().get("access_token")
+    except Exception as e:
+        print(f"[!] 获取 Outlook Access Token 失败: {e}")
     return None
 
-def setup_mail_tm(proxies=None):
-    """动态获取 mail.tm 邮箱并返回所需数据"""
-    mail_pw = "at41rvxgptye"
-    
-    # 动态获取当前可用的邮箱域名
-    domain_res = mreq("GET", "/domains", proxies=proxies)
-    if not domain_res or domain_res.status_code != 200:
-        print("  [!] 无法获取可用邮箱域名")
-        return None, None, None
-    
+def fetch_outlook_otp(email_addr, access_token):
     try:
-        js_data = domain_res.json()
-        if isinstance(js_data, list):
-            domains_data = js_data
-        elif isinstance(js_data, dict):
-            domains_data = js_data.get("hydra:member", js_data.get("hydra:collection", []))
-        else:
-            domains_data = []
-
-        if not domains_data:
-            print("  [!] 域名列表为空")
-            return None, None, None
-            
-        active_domain = domains_data[0].get("domain")
+        mail = imaplib.IMAP4_SSL("outlook.office365.com")
+        auth_string = f"user={email_addr}\x01auth=Bearer {access_token}\x01\x01"
+        mail.authenticate("XOAUTH2", lambda x: auth_string.encode("utf-8"))
+        
+        for folder in ["Junk", '"Junk Email"', "INBOX"]:
+            try:
+                status, _ = mail.select(folder)
+                if status != "OK":
+                    continue
+                status, messages = mail.search(None, 'UNSEEN', 'FROM', '"OpenAI"')
+                if status == "OK" and messages[0]:
+                    msg_ids = messages[0].split()
+                    for msg_id in reversed(msg_ids[-3:]):
+                        status, msg_data = mail.fetch(msg_id, "(RFC822)")
+                        for response_part in msg_data:
+                            if isinstance(response_part, tuple):
+                                msg = email.message_from_bytes(response_part[1])
+                                body = ""
+                                if msg.is_multipart():
+                                    for part in msg.walk():
+                                        if part.get_content_type() in ["text/plain", "text/html"]:
+                                            payload = part.get_payload(decode=True)
+                                            if payload: body += payload.decode(errors='ignore')
+                                else:
+                                    payload = msg.get_payload(decode=True)
+                                    if payload: body = payload.decode(errors='ignore')
+                                
+                                mt = re.search(r"(?<!#)\b(\d{6})\b", body) or re.search(r"(?<!#)\b(\d{6})\b", str(msg["Subject"]))
+                                if mt:
+                                    mail.store(msg_id, '+FLAGS', '\\Seen')
+                                    mail.logout()
+                                    return mt.group(1)
+            except Exception:
+                pass
+        mail.logout()
     except Exception as e:
-        print(f"  [!] 解析域名失败: {e}")
-        return None, None, None
+        print(f"  [Debug] IMAP 获取验证码异常: {e}")
+    return None
 
-    email = f"{rstr(10)}@{active_domain}"
-    openai_password = _gen_password()  # 为 OpenAI 账户生成高强度密码
+def setup_outlook(account, proxies=None):
+    email_addr = account["email"]
+    pwd = account["password"]
+    client_id = account["client_id"]
+    refresh_token = account["refresh_token"]
     
-    # 注册 mail.tm 邮箱
-    r = mreq("POST", "/accounts", {"address": email, "password": mail_pw}, proxies=proxies)
-    if not r or r.status_code not in [200, 201]: 
-        print(f"  [!] 邮箱注册被拒: {r.text if r else '无响应'}")
-        return None, None, None
-        
-    # 获取 mail.tm 的 Token
-    r = mreq("POST", "/token", {"address": email, "password": mail_pw}, proxies=proxies)
-    if not r or r.status_code != 200: 
-        print("  [!] 获取邮箱 Token 失败")
-        return None, None, None
-        
-    mail_token = r.json().get("token")
-    if not mail_token:
+    print(f"  [*] 尝试刷新 {email_addr} 的 Token...")
+    access_token = get_outlook_access_token(client_id, refresh_token, proxies)
+    if not access_token:
+        print("  [Error] 无法获取 Access Token")
         return None, None, None
 
-    # 定义提取验证码的闭包函数
+    # 生成 OpenAI 新密码，避免与 Outlook 密码冲突
+    openai_password = _gen_password()
+
     def fetch_code():
         print("  [*] 正在等待验证码 (最多等待约8分钟)...")
-        return getotp(mail_token, proxies=proxies)
+        for _ in range(60):
+            otp = fetch_outlook_otp(email_addr, access_token)
+            if otp: return otp
+            time.sleep(8)
+        return None
         
-    return email, openai_password, fetch_code
+    return email_addr, openai_password, fetch_code
 
 
 # ========== 2. OpenAI OAuth2 授权与环境生成模块 ==========
 
 AUTH_URL = "https://auth.openai.com/oauth/authorize"
 TOKEN_URL = "https://auth.openai.com/oauth/token"
-CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-DEFAULT_REDIRECT_URI = "http://localhost:1455/auth/callback"
+CLIENT_ID = "app_LlGpXReQgckcGGUo2JrYvtJK"
+DEFAULT_REDIRECT_URI = "com.openai.chat://auth0.openai.com/ios/com.openai.chat/callback"
 DEFAULT_SCOPE = "openid email profile offline_access"
 
 def _gen_password() -> str:
@@ -239,8 +260,7 @@ def generate_oauth_url(*, redirect_uri: str = DEFAULT_REDIRECT_URI, scope: str =
     params = {
         "client_id": CLIENT_ID, "response_type": "code", "redirect_uri": redirect_uri,
         "scope": scope, "state": state, "code_challenge": code_challenge,
-        "code_challenge_method": "S256", "prompt": "login",
-        "id_token_add_organizations": "true", "codex_cli_simplified_flow": "true",
+        "code_challenge_method": "S256", "prompt": "signup",
     }
     auth_url = f"{AUTH_URL}?{urllib.parse.urlencode(params)}"
     return OAuthStart(auth_url=auth_url, state=state, code_verifier=code_verifier, redirect_uri=redirect_uri)
@@ -299,30 +319,32 @@ def submit_callback_url(*, callback_url: str, expected_state: str, code_verifier
 
 # ========== 3. 核心注册与提取流程 ==========
 
-def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
+def run(proxy: Optional[str], account: dict) -> Optional[tuple[str, str, str]]:
     proxies = {"http": proxy, "https": proxy} if proxy else None
     s = requests.Session(proxies=proxies, impersonate="chrome120")
-    s.headers.update({"user-agent": UA})
 
-    print(f"[*] 初始化请求，准备获取临时邮箱...")
-    mail_data = setup_mail_tm(proxies)
-    if not mail_data or not mail_data[0]:
-        print("[Error] 获取 mail.tm 邮箱失败")
+    print(f"[*] 初始化请求，准备登录 Outlook XOAUTH2...")
+    email, password, code_fetcher = setup_outlook(account, proxies)
+    if not email:
+        print("[Error] Outlook 账号加载或刷新失败")
         return None
-        
-    email, password, code_fetcher = mail_data
     print(f"[*] 成功获取邮箱: {email}")
     print(f"[*] 生成高强度密码: {password}")
 
     oauth = generate_oauth_url()
     
     try:
-        # 第一步：进入 OAuth
-        resp = s.get(oauth.auth_url, timeout=15)
-        did = s.cookies.get("oai-did")
-        if not did:
-            print("[Error] 未能获取到 OpenAI Device ID (oai-did)")
-            return None
+        # 第一步：获取 CSRF 并进入 NextAuth Signin
+        csrf_resp = s.get("https://chatgpt.com/api/auth/csrf", timeout=15)
+        csrf_token = csrf_resp.json().get("csrfToken")
+        
+        login_id = str(uuid.uuid4())
+        did = str(uuid.uuid4())
+        s.cookies.set("oai-did", did, domain=".chatgpt.com")
+        s.cookies.set("oai-did", did, domain=".openai.com")
+
+        signin_url = f"https://chatgpt.com/api/auth/signin/openai?prompt=signup&ext-oai-did={did}&auth_session_logging_id={login_id}&screen_hint=signup&login_hint={urllib.parse.quote(email)}"
+        resp = s.post(signin_url, data={"csrfToken": csrf_token}, allow_redirects=True, timeout=15)
 
         # 第二步：获取 Sentinel Token (authorize_continue)
         sen_token = fetch_sentinel_token(flow="authorize_continue", did=did, proxies=proxies)
@@ -332,23 +354,39 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
         so_token = fetch_sentinel_token(flow="oauth_create_account", did=did, proxies=proxies)
 
         # 第四步：提交邮箱授权
-        signup_headers = {"referer": "https://auth.openai.com/create-account", "accept": "application/json", "content-type": "application/json"}
+        signup_headers = {"origin": "https://auth.openai.com", "referer": "https://auth.openai.com/create-account", "accept": "application/json", "content-type": "application/json"}
         if sentinel: signup_headers["openai-sentinel-token"] = sentinel
         signup_resp = s.post("https://auth.openai.com/api/accounts/authorize/continue", headers=signup_headers, data=json.dumps({"username": {"value": email, "kind": "email"}, "screen_hint": "signup"}))
+        print(f"[*] authorize/continue response: {signup_resp.status_code} {signup_resp.text}")
         if signup_resp.status_code != 200:
             print(f"[Error] 提交邮箱失败: {signup_resp.status_code}")
             return None
 
-        # 第五步：设置密码
-        register_headers = {"referer": "https://auth.openai.com/create-account/password", "accept": "application/json", "content-type": "application/json"}
-        if sentinel: register_headers["openai-sentinel-token"] = sentinel
-        reg_resp = s.post("https://auth.openai.com/api/accounts/user/register", headers=register_headers, data=json.dumps({"password": password, "username": email}))
-        if reg_resp.status_code != 200:
-            print(f"[Error] 设置密码失败: {reg_resp.status_code}")
-            return None
 
-        # 第六步：触发并提取验证码
-        s.get("https://auth.openai.com/api/accounts/email-otp/send", headers=register_headers, timeout=15)
+        continue_page = signup_resp.json().get("page", {}).get("type")
+        if continue_page == "create_account_password":
+            # Flow A: Password required
+            register_headers = {
+                "origin": "https://auth.openai.com",
+                "referer": "https://auth.openai.com/create-account/password", 
+                "accept": "application/json", 
+                "content-type": "application/json"
+            }
+            if sentinel: register_headers["openai-sentinel-token"] = sentinel
+            reg_resp = s.post("https://auth.openai.com/api/accounts/user/register", headers=register_headers, data=json.dumps({"password": password, "username": email}))
+            print(f"[*] user/register response: {reg_resp.status_code} {reg_resp.text}")
+            if reg_resp.status_code != 200:
+                print(f"[Error] 设置密码失败: {reg_resp.status_code}")
+                return None
+
+            send_resp = s.get("https://auth.openai.com/api/accounts/email-otp/send", headers=register_headers, timeout=15)
+            print(f"[*] email-otp/send response: {send_resp.status_code} {send_resp.text}")
+        else:
+            # Flow B: Passwordless
+            print("[*] Flow B: Passwordless. OTP already sent by authorize/continue or signin.")
+
+        
+        # 第六步：提取验证码
         code = code_fetcher()
         if not code:
             print("[Error] 验证码等待超时或提取失败")
@@ -356,20 +394,40 @@ def run(proxy: Optional[str]) -> Optional[tuple[str, str, str]]:
         print(f"[*] 成功提取验证码: {code}")
 
         # 第七步：校验验证码
-        validate_headers = {"referer": "https://auth.openai.com/email-verification", "accept": "application/json", "content-type": "application/json"}
+        validate_headers = {
+            "origin": "https://auth.openai.com",
+            "referer": "https://auth.openai.com/email-verification", 
+            "accept": "application/json", 
+            "content-type": "application/json"
+        }
         if sentinel: validate_headers["openai-sentinel-token"] = sentinel
+        print("Cookies before validate:", s.cookies)
         code_resp = s.post("https://auth.openai.com/api/accounts/email-otp/validate", headers=validate_headers, data=json.dumps({"code": code}))
+        print(f"[*] validate response: {code_resp.status_code} {code_resp.text}")
         if code_resp.status_code != 200:
             print(f"[Error] 验证码校验失败: {code_resp.status_code}")
             return None
 
-        # 第八步：完成账号注册填写
-        create_headers = {"referer": "https://auth.openai.com/about-you", "accept": "application/json", "content-type": "application/json"}
-        if so_token: create_headers["openai-sentinel-so-token"] = so_token
-        create_resp = s.post("https://auth.openai.com/api/accounts/create_account", headers=create_headers, data=json.dumps({"name": _random_name(), "birthdate": _random_birthdate()}))
-        if create_resp.status_code != 200:
-            print(f"[Error] 账户信息填写失败: {create_resp.status_code}")
-            return None
+        # 第八步：检查是否需要完成账号注册填写
+        try:
+            mode = signup_resp.json().get("page", {}).get("payload", {}).get("email_verification_mode")
+        except:
+            mode = "passwordless_signup"
+            
+        if mode == "passwordless_signup":
+            create_headers = {
+                "origin": "https://auth.openai.com",
+                "referer": "https://auth.openai.com/about-you", 
+                "accept": "application/json", 
+                "content-type": "application/json"
+            }
+            if so_token: create_headers["openai-sentinel-so-token"] = so_token
+            create_resp = s.post("https://auth.openai.com/api/accounts/create_account", headers=create_headers, data=json.dumps({"name": _random_name(), "birthdate": _random_birthdate()}))
+            if create_resp.status_code != 200:
+                print(f"[Error] 账户信息填写失败: {create_resp.status_code} {create_resp.text}")
+                return None
+        else:
+            print(f"[*] 检测到 login 模式 ({mode})，跳过 create_account 步骤")
 
         # 第九步：选择工作区 Workspace
         auth_cookie = s.cookies.get("oai-client-auth-session")
@@ -413,15 +471,37 @@ def main():
 
     count = 0
     print("========================================")
-    print("🚀 OpenAI 终极注册机 (带 Token 提取及 mail.tm) ")
+    print("🚀 OpenAI 终极注册机 (带 Token 提取及 Outlook XOAUTH2) ")
     print("========================================")
     
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    while True:
+    accounts = load_outlook_accounts()
+    if not accounts:
+        print("[!] 未找到可用的 Outlook 账号，程序退出")
+        return
+        
+    print(f"[*] 成功加载 {len(accounts)} 个 Outlook 账号")
+    
+    proxy_list = load_proxies()
+    if proxy_list:
+        print(f"[*] 成功加载 {len(proxy_list)} 个代理")
+
+    account_index = 0
+
+    while account_index < len(accounts):
         count += 1
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> 开始第 {count} 次注册流程 <<<")
-        run_result = run(args.proxy)
+        current_account = accounts[account_index]
+        account_index += 1
+        
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> 开始第 {count} 次注册流程 ({current_account['email']}) <<<")
+        
+        current_proxy = args.proxy
+        if proxy_list and not current_proxy:
+            current_proxy = random.choice(proxy_list)
+            print(f"[*] 使用代理: {current_proxy}")
+            
+        run_result = run(current_proxy, current_account)
         
         if run_result:
             token_json, email, password = run_result
@@ -435,7 +515,7 @@ def main():
             print(f"[🎉] 成功获取 Token！已保存至: {file_path}")
 
             # 保存机制 2：汇总账号密码信息
-            acc_file = tokens_dir / "accounts.txt"
+            acc_file = tokens_dir / "accounts_openai.txt"
             with open(acc_file, "a", encoding="utf-8") as f:
                 f.write(f"{email}----{password}\n")
             print(f"[📝] 账号已追加至: {acc_file}")
